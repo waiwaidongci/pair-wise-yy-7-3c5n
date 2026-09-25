@@ -3,6 +3,25 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  GEARS,
+  MAST_OFFSET_LIMIT_MM,
+  RESIDUAL_OFFSET_LIMIT_MM,
+  TrialError,
+} from "./trial-rules.js";
+import {
+  findModel,
+  listTrials,
+  findTrial,
+  activeTrialFor,
+  startTrial,
+  submitReadings,
+  registerRepair,
+  submitRetest,
+  invalidateForMaterialChange,
+  hasValidPass,
+} from "./trial-store.js";
+import { trialPage } from "./trial-page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "model-rigging-calibration.json");
@@ -70,9 +89,20 @@ function computeStats(items) {
   }
   return stats;
 }
-function summarize(item) {
+function summarize(db, item) {
   const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
+  const active = activeTrialFor(db, item);
+  const gate = hasValidPass(db, item);
+  return {
+    ...item,
+    logCount,
+    trial: {
+      no: (active || gate.trial || {}).no || null,
+      status: active ? active.status : gate.ok ? "试航通过" : gate.trial ? "结论失效" : null,
+      state: active ? active.status : gate.ok ? "试航通过" : gate.trial ? "结论失效" : "未试航",
+      deliverable: gate.ok,
+    },
+  };
 }
 function page() {
   return `<!doctype html>
@@ -93,12 +123,12 @@ function page() {
     .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
     .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
     .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
+    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; } .ok { color:#3f7a4f; font-weight:700; }
     @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
   </style>
 </head>
 <body>
-  <header><div><h1>古船模型帆索校准</h1><div class="meta">模型、帆索任务和校准记录串联</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>古船模型帆索校准</h1><div class="meta">模型、帆索任务和校准记录串联 · <a href="/trials">配重试航台（整船静载）</a></div></div><button id="reload">刷新</button></header>
   <main>
     <section>
       <form id="createForm"><h2>新增模型</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存模型</button></form>
@@ -138,14 +168,22 @@ function page() {
       const q = document.querySelector('#search').value.trim();
       const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
       cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
+      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => {
+        try {
+          await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) });
+        } catch (e) { alert(e.message); }
+        await load();
+      });
       document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
     }
     function cardHtml(item) {
       const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
       const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
       const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
+      const trialLine = item.trial && item.trial.state !== '未试航'
+        ? '<div class="'+(item.trial.deliverable?'ok':'warn')+'">试航：'+item.trial.state+(item.trial.no?' · '+item.trial.no:'')+(item.status==='已交付'||item.trial.deliverable?'':'（未通过不得交付）')+' · <a href="/trials">去试航台</a></div>'
+        : '<div class="warn">试航：未试航（未通过整船静载不得报完） · <a href="/trials">去试航台</a></div>';
+      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+trialLine+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
     }
     async function load() { items = await api('/api/items'); render(); }
     createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
@@ -162,7 +200,17 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+    if (req.method === "GET" && url.pathname === "/trials") return html(res, trialPage());
+    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(item => summarize(db, item)));
+    if (req.method === "GET" && url.pathname === "/api/trial-rules") {
+      return send(res, 200, { GEARS, MAST_OFFSET_LIMIT_MM, RESIDUAL_OFFSET_LIMIT_MM });
+    }
+    if (req.method === "GET" && url.pathname === "/api/trials") {
+      const ref = url.searchParams.get("model");
+      const model = ref ? findModel(db, ref) : null;
+      if (ref && !model) return send(res, 404, { error: "model_not_found" });
+      return send(res, 200, listTrials(db, model));
+    }
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
       const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建模型" }] };
@@ -175,11 +223,20 @@ const server = http.createServer(async (req, res) => {
     if (patch && req.method === "PATCH") {
       const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
+      const input = await body(req);
+      const oldMaterial = item.riggingMaterial || "";
+      Object.assign(item, input);
       item.logs ||= [];
+      // 索具材料改动会让旧试航结论失效（已交付的先撤回交付）
+      invalidateForMaterialChange(db, item, oldMaterial, saveDb);
+      // 整船静载试航没有有效通过结论，一律不得处于“已交付”（材料/配重改动使结论失效后同样拦回）
+      if (input.status === "已交付") {
+        const gate = hasValidPass(db, item);
+        if (!gate.ok) return send(res, 409, { error: gate.reason });
+      }
       item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
       await saveDb(db);
-      return send(res, 200, item);
+      return send(res, 200, summarize(db, item));
     }
     const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
     if (log && req.method === "POST") {
@@ -204,10 +261,30 @@ const server = http.createServer(async (req, res) => {
       await saveDb(db);
       return send(res, 201, item);
     }
+    // —— 配重试航台路由 ——
+    const startRoute = url.pathname.match(/^\/api\/models\/([^/]+)\/trials$/);
+    if (startRoute && req.method === "POST") {
+      const model = findModel(db, startRoute[1]);
+      if (!model) return send(res, 404, { error: "model_not_found" });
+      const { trial, invalidated } = startTrial(db, model, await body(req), saveDb);
+      return send(res, 201, { trial, invalidated: invalidated.map(t => t.no) });
+    }
+    const trialAction = url.pathname.match(/^\/api\/trials\/([^/]+)\/(readings|repair|retest)$/);
+    if (trialAction && req.method === "POST") {
+      const trial = findTrial(db, trialAction[1]);
+      if (!trial) return send(res, 404, { error: "trial_not_found" });
+      const input = await body(req);
+      const [, , action] = trialAction;
+      const updated =
+        action === "readings" ? submitReadings(db, trial, input, saveDb)
+        : action === "repair" ? registerRepair(db, trial, input, saveDb)
+        : submitRetest(db, trial, input, saveDb);
+      return send(res, 200, updated);
+    }
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
     send(res, 404, { error: "not_found" });
   } catch (error) {
-    send(res, 500, { error: error.message });
+    send(res, error instanceof TrialError ? error.statusCode : 500, { error: error.message });
   }
 });
 server.listen(port, () => console.log("古船模型帆索校准 listening on http://localhost:" + port));

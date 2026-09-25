@@ -3,6 +3,17 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  createTrial,
+  addRound,
+  addRepair,
+  invalidateOnItemUpdate,
+  listItemTrials,
+  trialView,
+  TrialError,
+} from "./records.js";
+import { deliveryGate } from "./judge.js";
+import { trialsPage } from "./trials-page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "model-rigging-calibration.json");
@@ -36,9 +47,9 @@ const seed = {
     }
   ]
 };
-const fields = [["code","模型编号","text"],["shipType","船型","text"],["scale","比例","text"],["mastCount","桅杆数量","number"],["riggingMaterial","帆索材料","text"],["owner","负责人","text"],["dueDate","交付日期","date"]];
-const stages = ["待检查","校准中","待复核","已交付"];
-const statLabels = ["待检查","校准中","待复核","已交付"];
+const fields = [["code","模型编号","text"],["shipType","船型","text"],["scale","比例","text"],["mastCount","桅杆数量","number"],["riggingMaterial","帆索材料","text"],["ballastSpec","配重配置","text"],["owner","负责人","text"],["dueDate","交付日期","date"]];
+const stages = ["待检查","校准中","待修整","待复核","已交付"];
+const statLabels = ["待检查","校准中","待修整","待复核","已交付"];
 const extraFields = [["position","索具位置"],["tension","松紧状态"],["note","调整备注"]];
 
 async function loadDb() {
@@ -70,9 +81,15 @@ function computeStats(items) {
   }
   return stats;
 }
-function summarize(item) {
+function latestTrial(db, item) {
+  const list = listItemTrials(db, item.code);
+  return list[0] || null;
+}
+function summarize(db, item) {
   const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
+  const trial = latestTrial(db, item);
+  const gate = trial ? deliveryGate(item, trial) : deliveryGate(item, null);
+  return { ...item, logCount, trialId: trial ? trial.id : null, trialState: trial ? trial.state : null, deliveryAllowed: gate.allowed, gateReason: gate.reason };
 }
 function page() {
   return `<!doctype html>
@@ -98,7 +115,7 @@ function page() {
   </style>
 </head>
 <body>
-  <header><div><h1>古船模型帆索校准</h1><div class="meta">模型、帆索任务和校准记录串联</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>古船模型帆索校准</h1><div class="meta">模型、帆索任务和校准记录串联 · <a href="/trials" style="color:var(--accent)">配重试航台 →</a></div></div><button id="reload">刷新</button></header>
   <main>
     <section>
       <form id="createForm"><h2>新增模型</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存模型</button></form>
@@ -111,8 +128,8 @@ function page() {
     </section>
   </main>
   <script>
-    const fields = [["code","模型编号","text"],["shipType","船型","text"],["scale","比例","text"],["mastCount","桅杆数量","number"],["riggingMaterial","帆索材料","text"],["owner","负责人","text"],["dueDate","交付日期","date"]];
-    const stages = ["待检查","校准中","待复核","已交付"];
+    const fields = [["code","模型编号","text"],["shipType","船型","text"],["scale","比例","text"],["mastCount","桅杆数量","number"],["riggingMaterial","帆索材料","text"],["ballastSpec","配重配置","text"],["owner","负责人","text"],["dueDate","交付日期","date"]];
+    const stages = ["待检查","校准中","待修整","待复核","已交付"];
     const extraFields = [["position","索具位置"],["tension","松紧状态"],["note","调整备注"]];
     const createForm = document.querySelector('#createForm');
     const actionForm = document.querySelector('#actionForm');
@@ -138,14 +155,22 @@ function page() {
       const q = document.querySelector('#search').value.trim();
       const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
       cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
+      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => {
+        try {
+          await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) });
+        } catch (e) { alert('无法更新状态：' + e.message); }
+        await load();
+      });
       document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
     }
     function cardHtml(item) {
       const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
       const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
       const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
+      const gate = item.deliveryAllowed
+        ? '<div style="color:#3f6b3a;font-weight:700">✓ 试航：'+(item.trialState||'')+'，可交付</div>'
+        : '<div class="warn">⛔ '+item.gateReason+(item.trialId?'（'+item.trialId+'）':'')+'</div>';
+      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+'<div class="meta"><b>帆索</b> '+(item.riggingMaterial||'')+' · <b>配重</b> '+(item.ballastSpec||'')+'</div>'+gate+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
     }
     async function load() { items = await api('/api/items'); render(); }
     createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
@@ -162,7 +187,8 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+    if (req.method === "GET" && url.pathname === "/trials") return html(res, trialsPage());
+    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(item => summarize(db, item)));
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
       const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建模型" }] };
@@ -174,12 +200,26 @@ const server = http.createServer(async (req, res) => {
     const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
     if (patch && req.method === "PATCH") {
       const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
+      if (!item) return send(res, 404, { error: { code: "item_not_found", message: "模型不存在" } });
+      const changes = await body(req);
+      // 交付门禁：没有合格且未失效的整船静载结论，不能直接报交付。
+      if (changes.status === "已交付") {
+        const gate = deliveryGate(item, latestTrial(db, item));
+        if (!gate.allowed) return send(res, 409, { error: { code: "delivery_blocked", message: gate.reason } });
+      }
+      // 配重或帆索材料改动 → 旧合格结论立即失效（判定规则在判定层）。
+      const invalidated = invalidateOnItemUpdate(db, item, changes);
+      const nextStatus = changes.status;
+      Object.assign(item, changes);
       item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
+      if (nextStatus && nextStatus !== undefined) {
+        item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
+      }
+      if (invalidated.length) {
+        item.logs.push({ at: new Date().toISOString(), step: "材料改动", note: invalidated.map(t => t.id + " 旧结论失效").join("；") });
+      }
       await saveDb(db);
-      return send(res, 200, item);
+      return send(res, 200, summarize(db, item));
     }
     const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
     if (log && req.method === "POST") {
@@ -203,6 +243,43 @@ const server = http.createServer(async (req, res) => {
       item.logs.push({ at: new Date().toISOString(), step: "帆索", note: input.position + " · " + input.tension });
       await saveDb(db);
       return send(res, 201, item);
+    }
+    // ---- 配重试航台：开立 / 初测复测 / 修整（记录与判定逻辑均在独立模块）----
+    const openTrial = url.pathname.match(/^\/api\/items\/([^/]+)\/trials$/);
+    if (openTrial && req.method === "POST") {
+      try {
+        const item = db.items.find(x => x.id === openTrial[1] || x.code === openTrial[1]);
+        if (!item) return send(res, 404, { error: { code: "item_not_found", message: "模型不存在" } });
+        const trial = createTrial(db, item.code, await body(req));
+        await saveDb(db);
+        return send(res, 201, trialView(db, trial, item));
+      } catch (error) {
+        return send(res, error instanceof TrialError ? 409 : 500, { error: { code: error.code || "error", message: error.message } });
+      }
+    }
+    if (req.method === "GET" && url.pathname === "/api/trials") {
+      const itemKey = url.searchParams.get("item");
+      const list = itemKey ? listItemTrials(db, itemKey) : (db.trials || []);
+      return send(res, 200, list.map(trial => {
+        const item = db.items.find(x => x.id === trial.itemId || x.code === trial.itemCode);
+        return item ? trialView(db, trial, item) : trial;
+      }));
+    }
+    const trialAction = url.pathname.match(/^\/api\/trials\/([^/]+)\/(rounds|repairs)$/);
+    if (trialAction && req.method === "POST") {
+      try {
+        const itemKey = url.searchParams.get("item");
+        const item = db.items.find(x => x.id === itemKey || x.code === itemKey);
+        if (!item) return send(res, 404, { error: { code: "item_not_found", message: "模型不存在" } });
+        const payload = await body(req);
+        const trial = trialAction[2] === "rounds"
+          ? addRound(db, item.code, trialAction[1], payload)
+          : addRepair(db, item.code, trialAction[1], payload);
+        await saveDb(db);
+        return send(res, 201, trialView(db, trial, item));
+      } catch (error) {
+        return send(res, error instanceof TrialError ? 409 : 500, { error: { code: error.code || "error", message: error.message } });
+      }
     }
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
     send(res, 404, { error: "not_found" });
